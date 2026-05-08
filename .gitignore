@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Data files (too large for git)
+*.csv
+*.xlsx
+*.db
+*.sqlite
+
+# Sensitive
+.env
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backtest cache
+backtest/__pycache__/
+
+# State files with tokens/sensitive data
+*rebalance_state.json

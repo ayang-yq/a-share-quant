@@ -1,6 +1,81 @@
-"""v4.3回测：带交易成本 + 迟滞带 + 调仓频率分层"""
+"""v4.3.2回测：精确A股交易成本(Zipline启发) + 迟滞带 + 调仓频率分层
+成本模型改进：
+  - v1: 固定0.1%单边(粗糙)
+  - v2: A股三费精确(佣金+印花税+过户费) + 二次滑点模型
+"""
 import warnings; warnings.filterwarnings('ignore')
 import pandas as pd, numpy as np, akshare as ak
+
+# ============ 精确A股交易成本模型(Zipline启发) ============
+class AShareCostModel:
+    """A股ETF交易成本精确模型
+    
+    灵感来自Zipline的VolumeShareSlippage + Commission分层架构：
+    - Commission层：固定费用(佣金+印花税+过户费)
+    - Slippage层：二次冲击成本 = price_impact * (volume_share^2)
+    
+    ETF交易费用明细(2023年后)：
+      佣金: 双边万2.5，不足5元按5元收
+      印花税: 卖出万0.5 (2023.8.28降为万0.5，之前万1)
+      过户费: 双边万0.1 (2022.4.29降为万0.1)
+    """
+    def __init__(self, commission_rate=0.00025, min_commission=5.0,
+                 stamp_tax_rate=0.00005, transfer_fee_rate=0.00001,
+                 price_impact=0.1, volume_limit=0.025):
+        self.commission_rate = commission_rate      # 券商佣金率(双边)
+        self.min_commission = min_commission        # 最低佣金(元)
+        self.stamp_tax_rate = stamp_tax_rate        # 印花税率(仅卖出)
+        self.transfer_fee_rate = transfer_fee_rate  # 过户费率(双边)
+        self.price_impact = price_impact            # 滑点冲击系数
+        self.volume_limit = volume_limit            # 单笔成交量占比上限
+    
+    def calculate(self, trade_value, is_buy=True, volume_share=0.0):
+        """计算单笔交易总成本
+        
+        Args:
+            trade_value: 交易金额(元)
+            is_buy: 买入/卖出
+            volume_share: 成交量占当日总成交量比例(0~1)，用于滑点
+        
+        Returns:
+            (commission, stamp_tax, transfer_fee, slippage) 四项成本
+        """
+        if trade_value <= 0:
+            return 0.0, 0.0, 0.0, 0.0
+        
+        # 佣金(双边，最低5元)
+        commission = max(trade_value * self.commission_rate, self.min_commission)
+        
+        # 印花税(仅卖出)
+        stamp_tax = 0.0 if is_buy else trade_value * self.stamp_tax_rate
+        
+        # 过户费(双边)
+        transfer_fee = trade_value * self.transfer_fee_rate
+        
+        # 二次滑点(Zipline VolumeShareSlippage)
+        # 冲击成本 = price_impact * volume_share^2
+        vs = min(volume_share, self.volume_limit)
+        slippage = trade_value * self.price_impact * (vs ** 2)
+        
+        return commission, stamp_tax, transfer_fee, slippage
+    
+    def total_rate(self, is_buy=True, volume_share=0.0):
+        """简化接口：返回总费率(用于快速估算)"""
+        rate = self.commission_rate + self.transfer_fee_rate
+        if not is_buy:
+            rate += self.stamp_tax_rate
+        vs = min(volume_share, self.volume_limit)
+        rate += self.price_impact * (vs ** 2)
+        return rate
+    
+    def blended_rate(self, volume_share=0.0):
+        """买卖混合单边费率(假设50%买+50%卖)"""
+        buy_rate = self.total_rate(True, volume_share)
+        sell_rate = self.total_rate(False, volume_share)
+        return (buy_rate + sell_rate) / 2
+
+# 全局成本模型实例
+COST_MODEL = AShareCostModel()
 
 # ============ 数据获取 ============
 ETF_MAP = {'红利':'510880','沪深300':'510300','国证2000':'159907','进攻':'159908'}
@@ -109,28 +184,32 @@ ETF_COLS = ['红利','沪深300','国证2000','进攻']
 WEIGHT_COLS = ['w_div','w_300','w_2000','w_atk']
 PRICE_COLS = ['红利','沪深300','国证2000','进攻']
 
-def backtest(df, weights_fn, rebalance_freq='daily', drift_threshold=0.0, cost_rate=0.001):
+def backtest(df, weights_fn, rebalance_freq='daily', drift_threshold=0.0, 
+             cost_rate=0.001, cost_model=None, portfolio_value=1e6):
     """
-    rebalance_freq: 'daily','weekly','biweekly','monthly'
-    drift_threshold: 品类权重累计漂移超此值才触发调仓(0=每次freq都调)
-    cost_rate: 单边交易成本(ETF约0.03-0.05%,这里用0.1%含滑点)
+    回测引擎 v4.3.2
+    
+    cost_rate: 简单单边费率(向后兼容)，仅当cost_model=None时使用
+    cost_model: AShareCostModel实例，启用精确三费+滑点
+    portfolio_value: 初始资金(元)，用于精确计算佣金最低5元门槛
     """
     dates = df['date'].values
     prices = df[PRICE_COLS].values  # (N, 4)
     n = len(df)
     
     # 预计算目标权重
-    target_weights = np.zeros((n, 4))  # [红利, 300, 2000, 进攻]
+    target_weights = np.zeros((n, 4))
     for i in range(n):
-        w = weights_fn(i)
-        target_weights[i] = w
+        target_weights[i] = weights_fn(i)
     
     # 模拟
-    cash_weight = np.ones(n)
     nav = 1.0
-    holdings = np.array([0.25, 0.25, 0.25, 0.25])  # 初始等权
-    cash = 0.0  # 无现金
+    holdings = np.array([0.25, 0.25, 0.25, 0.25])
     total_cost = 0.0
+    total_commission = 0.0
+    total_stamp_tax = 0.0
+    total_transfer = 0.0
+    total_slippage = 0.0
     rebalance_count = 0
     nav_series = [nav]
     
@@ -140,12 +219,17 @@ def backtest(df, weights_fn, rebalance_freq='daily', drift_threshold=0.0, cost_r
         if i == 0:
             # 第一天：调到目标
             tw = target_weights[0]
-            turnover = np.sum(np.abs(holdings - tw))
-            cost = turnover * nav * cost_rate
-            nav -= cost
+            trade_amounts = np.abs(holdings - tw) * nav * portfolio_value
+            cost, cost_detail = _calc_trade_cost(trade_amounts, holdings, tw, 
+                                                   cost_rate, cost_model)
+            nav -= cost / portfolio_value
             total_cost += cost
+            if cost_detail:
+                total_commission += cost_detail['commission']
+                total_stamp_tax += cost_detail['stamp_tax']
+                total_transfer += cost_detail['transfer_fee']
+                total_slippage += cost_detail['slippage']
             holdings = tw.copy()
-            cash = nav * cash_weight[0] if i < len(cash_weight) else 0
             rebalance_count += 1
             last_rebalance_day = i
             nav_series.append(nav)
@@ -185,12 +269,24 @@ def backtest(df, weights_fn, rebalance_freq='daily', drift_threshold=0.0, cost_r
         
         # 执行调仓
         tw = target_weights[i]
-        # 先算含现金的目标权重
-        cw = 1.0 - np.sum(tw)  # cash weight
-        turnover = np.sum(np.abs(holdings - tw))
-        cost = turnover * nav * cost_rate
-        nav -= cost
+        trade_amounts = np.abs(holdings - tw) * nav * portfolio_value
+        
+        if cost_model is not None:
+            cost, cost_detail = _calc_trade_cost(trade_amounts, holdings, tw,
+                                                   cost_rate, cost_model)
+        else:
+            turnover = np.sum(np.abs(holdings - tw))
+            cost = turnover * nav * portfolio_value * cost_rate
+            cost_detail = None
+        
+        nav -= cost / portfolio_value
         total_cost += cost
+        if cost_detail:
+            total_commission += cost_detail['commission']
+            total_stamp_tax += cost_detail['stamp_tax']
+            total_transfer += cost_detail['transfer_fee']
+            total_slippage += cost_detail['slippage']
+        
         holdings = tw.copy()
         rebalance_count += 1
         last_rebalance_day = i
@@ -204,106 +300,113 @@ def backtest(df, weights_fn, rebalance_freq='daily', drift_threshold=0.0, cost_r
     dd = (nav_series - cummax) / cummax
     max_dd = np.min(dd)
     
-    return {
+    result = {
         'ann_ret': ann_ret, 'ann_vol': ann_vol, 'sharpe': sharpe,
         'max_dd': max_dd, 'final_nav': nav, 'rebalance_count': rebalance_count,
-        'total_cost': total_cost, 'total_cost_pct': total_cost / nav * 100,
+        'total_cost': total_cost, 'total_cost_pct': total_cost / (nav * portfolio_value) * 100,
         'nav_series': nav_series
     }
+    
+    if cost_model is not None:
+        result.update({
+            'cost_commission': total_commission,
+            'cost_stamp_tax': total_stamp_tax,
+            'cost_transfer': total_transfer,
+            'cost_slippage': total_slippage,
+        })
+    
+    return result
 
-# ============ 准备回测 ============
-df_full['split'] = df_full['pct_xd'].apply(calc_split)
 
-# 迟滞带状态序列
-states_hyst = state_with_hysteresis(df_full['pos_total'].values, 
-                                      low_down=0.35, low_up=0.45, 
-                                      high_down=0.60, high_up=0.70)
+def _calc_trade_cost(trade_amounts, old_weights, new_weights, simple_rate, cost_model):
+    """计算调仓交易成本
+    
+    Returns: (total_cost, cost_detail_dict)
+    """
+    total_commission = 0.0
+    total_stamp_tax = 0.0
+    total_transfer = 0.0
+    total_slippage = 0.0
+    
+    if cost_model is None:
+        # 简单模式(向后兼容)
+        total = np.sum(trade_amounts) * simple_rate
+        return total, None
+    
+    for j in range(4):
+        amt = trade_amounts[j]
+        if amt < 1e-6:
+            continue
+        is_buy = new_weights[j] > old_weights[j]
+        comm, stamp, xfer, slip = cost_model.calculate(
+            trade_value=amt, is_buy=is_buy, volume_share=0.0  # ETF日频回测volume_share≈0
+        )
+        total_commission += comm
+        total_stamp_tax += stamp
+        total_transfer += xfer
+        total_slippage += slip
+    
+    total = total_commission + total_stamp_tax + total_transfer + total_slippage
+    return total, {
+        'commission': total_commission,
+        'stamp_tax': total_stamp_tax,
+        'transfer_fee': total_transfer,
+        'slippage': total_slippage,
+    }
 
-# 原始连续三态(无迟滞)
-states_orig = pd.cut(df_full['pos_total'], bins=[-0.1,0.40,0.65,1.0], labels=[0,1,2]).cat.codes.values
 
-# 截取回测区间
-mask = df_full['date'] >= '2012-05-28'
-idx_start = np.where(mask)[0][0]
-idx_end = len(df_full)
-df_bt = df_full[idx_start:idx_end].reset_index(drop=True)
-n_bt = len(df_bt)
-
-print(f'回测区间: {df_bt["date"].iloc[0].strftime("%Y-%m-%d")} ~ {df_bt["date"].iloc[-1].strftime("%Y-%m-%d")}')
-print(f'交易日: {n_bt} ({n_bt/252:.1f}年)')
-print()
-
-# ============ 定义多组权重函数 ============
-# 策略A: 原始连续三态(无迟滞)，每日调仓，无成本
-# 策略B: 原始连续三态，每日调仓，0.1%成本
-# 策略C: 迟滞带离散三态，每日调仓，0.1%成本
-# 策略D: 迟滞带离散三态，周度调仓，0.1%成本
-# 策略E: 迟滞带离散三态，双周调仓，0.1%成本
-# 策略F: 迟滞带离散三态，月度调仓，0.1%成本
-# 策略G: 迟滞带离散三态，周度+3%漂移阈值，0.1%成本
-# 策略H: 迟滞带离散三态，月度+3%漂移阈值，0.1%成本
-# 策略I: 迟滞带离散三态，月度+5%漂移阈值，0.1%成本
-
-COST = 0.001  # 0.1%单边 (ETF佣金+滑点)
-
-def make_weights_fn(use_hyst, mode='continuous'):
-    """返回一个 weights_fn(i_offset) -> [wd, w3, w2, wa]"""
-    def fn(i):
-        gi = i + idx_start  # global index
-        pt = df_full['pos_total'].iloc[gi]
-        sp = df_full['split'].iloc[gi]
-        
-        if mode == 'continuous':
-            # 原始连续映射
-            t = float(np.clip((pt - 0.40) / 0.25, 0, 1))
-            CFG = {'红利':{'防御':0.20,'进攻':0.10},'宽基':{'防御':0.10,'进攻':0.20},'进攻':{'防御':0.05,'进攻':0.45}}
-            wd = CFG['红利']['防御'] + t * (CFG['红利']['进攻'] - CFG['红利']['防御'])
-            wb = CFG['宽基']['防御'] + t * (CFG['宽基']['进攻'] - CFG['宽基']['防御'])
-            wa = CFG['进攻']['防御'] + t * (CFG['进攻']['进攻'] - CFG['进攻']['防御'])
-            sf = (sp - 0.50) / 0.40; wd += 0.03 * sf; wa -= 0.03 * sf
-            w3 = wb * sp; w2 = wb * (1 - sp)
-            wc = 1 - w3 - w2 - wd - wa
-            wd = float(np.clip(wd, 0.05, 0.25))
-            wa = float(np.clip(wa, 0.05, 0.45))
-            wc = 1 - w3 - w2 - wd - wa
-            if wc < 0.20:
-                wa = max(wa - (0.20 - wc), 0.05)
-                wc = 1 - w3 - w2 - wd - wa
-            return [wd, w3, w2, wa]
-        else:
-            state = states_hyst[gi] if use_hyst else states_orig[gi]
-            w = calc_weights_with_state(pt, sp, state)
-            return [w[0], w[1], w[2], w[3]]  # 4个权益权重
-    return fn
-
-# 基准：满仓300
-def buy_hold_300_fn(i):
-    return [0.0, 1.0, 0.0, 0.0]
 
 # ============ 运行回测 ============
 configs = [
-    ('A: 连续三态+日调+0成本',    make_weights_fn(False, 'continuous'), 'daily',    0.0,  0.0),
-    ('B: 连续三态+日调+0.1%成本', make_weights_fn(False, 'continuous'), 'daily',    0.0,  COST),
-    ('C: 迟滞离散+日调+0.1%成本', make_weights_fn(True,  'discrete'),   'daily',    0.0,  COST),
-    ('D: 迟滞离散+周调+0.1%成本', make_weights_fn(True,  'discrete'),   'weekly',   0.0,  COST),
-    ('E: 迟滞离散+双周调+0.1%成本',make_weights_fn(True,  'discrete'),   'biweekly', 0.0,  COST),
-    ('F: 迟滞离散+月调+0.1%成本',  make_weights_fn(True,  'discrete'),   'monthly',  0.0,  COST),
-    ('G: 迟滞离散+周调+3%阈值',   make_weights_fn(True,  'discrete'),   'weekly',   0.03, COST),
-    ('H: 迟滞离散+月调+3%阈值',   make_weights_fn(True,  'discrete'),   'monthly',  0.03, COST),
-    ('I: 迟滞离散+月调+5%阈值',   make_weights_fn(True,  'discrete'),   'monthly',  0.05, COST),
-    ('J: 迟滞离散+月调+8%阈值',   make_weights_fn(True,  'discrete'),   'monthly',  0.08, COST),
-    ('基准: 满仓沪深300',           buy_hold_300_fn,                       'daily',    0.0,  0.0),
+    ('A: 连续三态+日调+0成本',    make_weights_fn(False, 'continuous'), 'daily',    0.0,  0.0,   None),
+    ('B: 连续三态+日调+0.1%成本', make_weights_fn(False, 'continuous'), 'daily',    0.0,  COST,  None),
+    ('C: 迟滞离散+日调+0.1%成本', make_weights_fn(True,  'discrete'),   'daily',    0.0,  COST,  None),
+    ('D: 迟滞离散+周调+0.1%成本', make_weights_fn(True,  'discrete'),   'weekly',   0.0,  COST,  None),
+    ('E: 迟滞离散+双周调+0.1%成本',make_weights_fn(True,  'discrete'),   'biweekly', 0.0,  COST,  None),
+    ('F: 迟滞离散+月调+0.1%成本',  make_weights_fn(True,  'discrete'),   'monthly',  0.0,  COST,  None),
+    ('G: 迟滞离散+周调+3%阈值',   make_weights_fn(True,  'discrete'),   'weekly',   0.03, COST,  None),
+    ('H: 迟滞离散+月调+3%阈值',   make_weights_fn(True,  'discrete'),   'monthly',  0.03, COST,  None),
+    ('I: 迟滞离散+月调+5%阈值',   make_weights_fn(True,  'discrete'),   'monthly',  0.05, COST,  None),
+    ('J: 迟滞离散+月调+8%阈值',   make_weights_fn(True,  'discrete'),   'monthly',  0.08, COST,  None),
+    ('K: 迟滞月调3%+精确成本',    make_weights_fn(True,  'discrete'),   'monthly',  0.03, 0.0,   COST_MODEL),
+    ('L: 迟滞日调+精确成本',      make_weights_fn(True,  'discrete'),   'daily',    0.0,  0.0,   COST_MODEL),
+    ('基准: 满仓沪深300',           buy_hold_300_fn,                       'daily',    0.0,  0.0,   None),
 ]
 
-print(f'{"策略":<30} {"年化":>7} {"波动":>7} {"夏普":>6} {"最大回撤":>8} {"调仓次数":>8} {"成本占比":>8}')
+print(f'回测资金: ¥2,000,000 (200万)')
+print(f'成本模型: v1=固定0.1% | v2=佣金万2.5+印花税万0.5(卖出)+过户费万0.1+二次滑点')
+print()
+hdr = f'{"策略":<30} {"年化":>7} {"波动":>7} {"夏普":>6} {"最大回撤":>8} {"调仓次数":>8} {"成本占比":>8}'
+print(hdr)
 print('-' * 90)
 
 results = {}
-for label, wfn, freq, drift, cost in configs:
-    r = backtest(df_bt, wfn, rebalance_freq=freq, drift_threshold=drift, cost_rate=cost)
+for label, wfn, freq, drift, cost, cmodel in configs:
+    r = backtest(df_bt, wfn, rebalance_freq=freq, drift_threshold=drift,
+                 cost_rate=cost, cost_model=cmodel, portfolio_value=2_000_000)
     results[label] = r
-    yrs = n_bt / 252
     print(f'{label:<30} {r["ann_ret"]*100:>6.1f}% {r["ann_vol"]*100:>6.1f}% {r["sharpe"]:>6.2f} {r["max_dd"]*100:>7.1f}% {r["rebalance_count"]:>7}次 {r["total_cost_pct"]:>7.2f}%')
+
+# 精确成本分解
+print()
+print('=== 精确成本模型(v2)费用分解 ===')
+for label in ['K: 迟滞月调3%+精确成本', 'L: 迟滞日调+精确成本']:
+    r = results[label]
+    tc = r['total_cost']
+    print(f'\n  {label}:')
+    print(f'    总成本: ¥{tc:,.0f} (占终值{r["total_cost_pct"]:.2f}%)')
+    print(f'      佣金:   ¥{r["cost_commission"]:>10,.0f} ({r["cost_commission"]/tc*100:.1f}%)')
+    print(f'      印花税: ¥{r["cost_stamp_tax"]:>10,.0f} ({r["cost_stamp_tax"]/tc*100:.1f}%)')
+    print(f'      过户费: ¥{r["cost_transfer"]:>10,.0f} ({r["cost_transfer"]/tc*100:.1f}%)')
+    print(f'      滑点:   ¥{r["cost_slippage"]:>10,.0f} ({r["cost_slippage"]/tc*100:.1f}%)')
+    # v1 vs v2对比
+    if '月调' in label:
+        v1_label = 'H: 迟滞离散+月调+3%阈值'
+    else:
+        v1_label = 'C: 迟滞离散+日调+0.1%成本'
+    v1_cost = results[v1_label]['total_cost']
+    diff_pct = (tc - v1_cost) / v1_cost * 100
+    print(f'    vs v1固定0.1%: ¥{v1_cost:,.0f} -> ¥{tc:,.0f} ({diff_pct:+.1f}%)')
 
 print()
 
@@ -324,9 +427,9 @@ for s, sn in [(0,'防御'),(1,'均衡'),(2,'进攻')]:
 print()
 
 # ============ 分年度对比(选最实用的几个策略) ============
-print('=== 分年度对比(迟滞+月调+3%阈值 vs 原始+日调) ===')
-key_strategies = ['A: 连续三态+日调+0成本', 'C: 迟滞离散+日调+0.1%成本', 'H: 迟滞离散+月调+3%阈值']
-key_labels = ['日调0成本', '迟滞日调', '迟滞月调+3%']
+print('=== 分年度对比(核心策略) ===')
+key_strategies = ['A: 连续三态+日调+0成本', 'K: 迟滞月调3%+精确成本', 'H: 迟滞离散+月调+3%阈值']
+key_labels = ['日调0成本(理想)', '月调精确成本(v2)', '月调0.1%(v1)']
 
 df_years = pd.DataFrame()
 for label, klabel in zip(key_strategies, key_labels):
@@ -344,36 +447,37 @@ for label, klabel in zip(key_strategies, key_labels):
 
 print(f'{"年份":<6}', end='')
 for l in key_labels:
-    print(f'{l:>12}', end='')
+    print(f'{l:>18}', end='')
 print()
-print('-' * 42)
+print('-' * 60)
 for y in df_years.index:
     print(f'{y:<6}', end='')
     for l in key_labels:
         v = df_years[l].get(y, 0)
-        print(f'{v:>11.1f}%', end='')
+        print(f'{v:>17.1f}%', end='')
     print()
 
 # 年化差异
 r0 = results[key_strategies[0]]
-rH = results[key_strategies[2]]
-print(f'\n夏普损失: {r0["sharpe"] - rH["sharpe"]:.2f}')
-print(f'年化损失: {(r0["ann_ret"] - rH["ann_ret"])*100:.1f}%')
-print(f'成本节省: 调仓{rH["rebalance_count"]}次 vs {r0["rebalance_count"]}次 (减少{(1-rH["rebalance_count"]/r0["rebalance_count"])*100:.0f}%)')
+rK = results[key_strategies[1]]
+print(f'\n精确成本(v2) vs 理想值:')
+print(f'  夏普损失: {r0["sharpe"] - rK["sharpe"]:.2f}')
+print(f'  年化损失: {(r0["ann_ret"] - rK["ann_ret"])*100:.1f}%')
+print(f'  调仓次数: {rK["rebalance_count"]}')
 
 print()
 
-# ============ 200万模拟 ============
-print('=== 200万模拟(迟滞+月调+3%阈值) ===')
-r = results['H: 迟滞离散+月调+3%阈值']
+# ============ 200万模拟(精确成本) ============
+print('=== 200万模拟(迟滞+月调+3%+精确成本) ===')
+r = results['K: 迟滞月调3%+精确成本']
 nav = r['nav_series']
-start_val = 2000000
+start_val = 2_000_000
 end_val = start_val * nav[-1]
 max_loss = start_val * r['max_dd']
-cost_total = r['total_cost_pct'] / 100 * end_val  # 近似
-print(f'  初始: ¥2,000,000')
+print(f'  初始: ¥{start_val:,.0f}')
 print(f'  终值: ¥{end_val:,.0f} ({(end_val/start_val-1)*100:.0f}%)')
 print(f'  最大亏损: ¥{max_loss:,.0f}')
 print(f'  年化收益: ¥{(end_val/start_val)**(1/(n_bt/252))*start_val - start_val:,.0f}/年')
+print(f'  总交易成本: ¥{r["total_cost"]:,.0f} ({r["total_cost_pct"]:.2f}%)')
 
 print('\n完成.')

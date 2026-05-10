@@ -4,7 +4,48 @@
   - v2: A股三费精确(佣金+印花税+过户费) + 二次滑点模型
 """
 import warnings; warnings.filterwarnings('ignore')
-import pandas as pd, numpy as np, akshare as ak
+import pandas as pd, numpy as np
+
+# ============ 修复东财API TLS指纹拦截 ============
+# Python 3.13 的 TLS 指纹被东财服务器识别并拒绝连接
+# 方案：monkey-patch requests.get，用浏览器UA + SSL上下文兼容
+import requests, ssl
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
+
+class TLS12Adapter(HTTPAdapter):
+    """强制 TLS 1.2 + 浏览器级 SSL 配置，绕过东财 TLS 指纹检测"""
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context(ssl_version=ssl.PROTOCOL_TLS_CLIENT)
+        ctx.set_ciphers(
+            'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20'
+            ':ECDHE+AES:DHE+AES:AES128:AES256:HIGH:!aNULL:!eNULL:!MD5:!3DES'
+        )
+        ctx.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+        ctx.options &= ~ssl.OP_NO_TLSv1_2  # 确保 TLS 1.2 可用
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        kwargs['ssl_context'] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
+# 全局 session 带 TLS12 adapter + 浏览器 UA
+_tls_session = requests.Session()
+_tls_session.mount('https://', TLS12Adapter())
+_tls_session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Referer': 'https://quote.eastmoney.com/',
+})
+
+_orig_get = requests.Session.get
+def _patched_get(self, url, **kwargs):
+    # 东财API走自定义session，其他正常
+    if 'eastmoney.com' in url:
+        return _tls_session.get(url, **kwargs)
+    return _orig_get(self, url, **kwargs)
+requests.Session.get = _patched_get
+
+import akshare as ak
 
 # ============ 精确A股交易成本模型(Zipline启发) ============
 class AShareCostModel:

@@ -30,7 +30,3 @@ backtest/__pycache__/
 
 # State files with tokens/sensitive data
 *rebalance_state.json
-
-# Backtest reports (auto-generated, too large for git)
-backtest/reports/
-*.html

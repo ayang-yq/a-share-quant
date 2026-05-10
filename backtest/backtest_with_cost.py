@@ -8,16 +8,18 @@ import pandas as pd, numpy as np
 
 # ============ 修复东财API TLS指纹拦截 ============
 # Python requests 的 TLS 指纹被东财识别拒绝，用 curl_cffi 模拟浏览器指纹
+# 关键：patch requests.api.get 而非 Session.get（akshare 用的是模块级 requests.get）
 from curl_cffi import requests as cffi_requests
-import requests
+import requests.api
 
-_orig_get = requests.Session.get
-def _patched_get(self, url, **kwargs):
+_orig_api_get = requests.api.get
+def _patched_api_get(url, **kwargs):
     if 'eastmoney.com' in url:
         kwargs.setdefault('impersonate', 'chrome')
         return cffi_requests.get(url, **kwargs)
-    return _orig_get(self, url, **kwargs)
-requests.Session.get = _patched_get
+    return _orig_api_get(url, **kwargs)
+requests.api.get = _patched_api_get
+requests.get = _patched_api_get
 
 import akshare as ak
 
